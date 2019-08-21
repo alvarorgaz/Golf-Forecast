@@ -1,0 +1,65 @@
+---
+title: "GolfForecast - Preliminary analysis"
+author: "Álvaro Orgaz Expósito"
+output: html_document
+---
+
+## Read data
+
+```{r}
+library(readxl)
+data <- read_xlsx(path="Data.xlsx", col_names=TRUE, na="")
+data <- as.data.frame(data)
+data <- data[order(data$Week),]
+```
+
+## Activate parallelization
+```{r}
+max_threads <- 6
+cluster <- parallel::makeCluster(max_threads)
+doParallel::registerDoParallel(cluster)
+```
+
+## Preliminary analysis
+
+Number of unique values:
+```{r}
+sapply(data, function(x) length(unique(x))) 
+```
+
+Basic statistics:
+```{r}
+summary(data)
+quantile(data$RankingPoints, probs=seq(0, 1, 0.05), na.rm=TRUE)
+hist(data$RankingPoints, breaks=c(0,1,2,3,4,5,25,50,75,100))
+hist(data$Position)
+```
+
+Number of competitions (unique "Weeks") per golfer:
+```{r}
+competitions_per_golfer <- sapply(unique(data$GolferID),
+                                  function(x) length(unique(data$Week[data$GolferID==x])))
+round(table(competitions_per_golfer)/length(competitions_per_golfer)*100, 2)
+hist(competitions_per_golfer)
+```
+
+Number of competitions per golfer and week (to study golfers with >1 competition in the same week):
+```{r warning=FALSE}
+save(data, file="tmp.RData")
+auxiliary <- function(golfer){
+  load("tmp.RData")
+  result <- data.frame()
+  for(week in unique(data$Week[data$GolferID==golfer])){
+    result <- rbind(result, c(golfer,week,nrow(data[data$GolferID==golfer & data$Week==week,])))
+  }
+  colnames(result) <- c("GolferID","Week","Frequency")
+  return(result)
+}
+list_competitions_per_golfer_week <- plyr::llply(unique(data$GolferID), auxiliary, .parallel=TRUE)
+competitions_per_golfer_week <- data.frame(do.call("rbind", list_competitions_per_golfer_week))
+file.remove("tmp.Rdata")
+cat("There are", sum(competitions_per_golfer_week$Frequency>1),"cases of golfers with >1 competition per week and these are all the cases:")
+competitions_per_golfer_week[competitions_per_golfer_week$Frequency>1,]
+```
+
+
