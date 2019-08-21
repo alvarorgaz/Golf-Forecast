@@ -1,0 +1,258 @@
+---
+title: "GolfForecast - Modelling"
+author: "Álvaro Orgaz Expósito"
+date: "5 February 2019"
+output: html_document
+---
+
+# Load data
+
+```{r}
+load("Data.RData")
+```
+
+# Define performance metrics
+
+```{r}
+mse <- function(true_values,predictions){ return(mean((true_values-predictions)^2)) }
+kendall <- function(true_values,predictions){ return(cor(true_values,predictions,method="kendall")) }
+```
+
+# Resume of features
+
+```{r}
+features_id <- c("Golfer","Week")
+target_position <- "Position"
+target_points <- "RankingPoints"
+features_position_lag15 <- c("Bests","Worsts",
+                             paste0("Position_Lag",1:15),
+                             paste0("Position_Lag",1:15,"_Bin"),
+                             sapply(seq(1,15,5),function(lag) paste0("Position_Lag",lag,"to",lag+4)),
+                             "Variance")
+features_position_lag20 <- c("Bests","Worsts",
+                             paste0("Position_Lag",1:20),
+                             paste0("Position_Lag",1:20,"_Bin"),
+                             sapply(seq(1,20,5),function(lag) paste0("Position_Lag",lag,"to",lag+4)),
+                             "Variance")
+features_points_lag15 <- c("Bests","Worsts",
+                           paste0("RankingPoints_Lag",1:15),
+                           paste0("RankingPoints_Lag",1:15,"_Bin"),
+                           sapply(seq(1,15,5),function(lag) paste0("RankingPoints_Lag",lag,"to",lag+4)),
+                           "Variance")
+features_points_lag20 <- c("Bests","Worsts",
+                           paste0("RankingPoints_Lag",1:20),
+                           paste0("RankingPoints_Lag",1:20,"_Bin"),
+                           sapply(seq(1,20,5),function(lag) paste0("RankingPoints_Lag",lag,"to",lag+4)),
+                           "Variance")
+```
+
+# Auxiliar function for grid search
+
+Auxiliary function does back-testing for one given parametrization. Returns the metrics value for each week in training data using until the previous week for training the model.
+```{r}
+auxiliary <- function(p){
+  load("Objects_backtesting_grid_search.RData")
+  library(xgboost)
+  metric1_periods <- c()
+  metric2_periods <- c()
+  for(period_index in 1:(length(periods_ordered)-1)){
+    # Train set: all periods until period_index included
+    train <- data[data[,feature_periods]>=periods_ordered[period_index],] # Higher period value means older
+    train_xgbDMatrix <- xgb.DMatrix(data=data.matrix(train[,features]),label=train[,target])
+    # Validation set: next period after period_index
+    test <- data[data[,feature_periods]==periods_ordered[period_index+1],]
+    test_xgbDMatrix <- xgb.DMatrix(data=data.matrix(test[,features]))
+    # Train model
+    set.seed(1)
+    model_XGB <- xgboost(data=train_xgbDMatrix,
+                         booster="gbtree",
+                         max_depth=parametrizations[p,"max_depth"],
+                         nrounds=parametrizations[p,"nrounds"],
+                         eta=parametrizations[p,"eta"],
+                         min_child_weight=parametrizations[p,"min_child_weight"],
+                         subsample=parametrizations[p,"subsample"],
+                         colsample_bytree=parametrizations[p,"colsample_bytree"],
+                         objective="reg:linear",
+                         num_parallel_tree=1,
+                         verbose=FALSE,
+                         missing=-9999) # 500 rounds + max_depth 10 + period_index 50 = 41sec * 50 = 33min/param
+    # Predict Test
+    test_prediction <- predict(model_XGB,test_xgbDMatrix)
+    metric1_periods <- c(metric1_periods,metric1(test[,target],test_prediction))
+    metric2_periods <- c(metric2_periods,metric2(test[,target],test_prediction))
+  }
+  return(list(metric1_periods,metric2_periods))
+}
+```
+
+# Activate parallelization
+
+```{r}
+max_threads <- parallel::detectCores()
+cluster <- parallel::makeCluster(max_threads)
+doParallel::registerDoParallel(cluster)
+```
+
+# Parametrizations for grid search
+
+```{r}
+max_depth <- c(10,15)
+nrounds <- c(500,250,100,50)
+eta <- c(0.01,0.05,0.1)
+min_child_weight <- c(5,10,15)
+subsample <- c(0.5,0.75)
+colsample_bytree <-  c(0.5,0.75) 
+parametrizations <- expand.grid(max_depth,nrounds,eta,min_child_weight,subsample,colsample_bytree)
+names(parametrizations) <- c("max_depth","nrounds","eta","min_child_weight","subsample","colsample_bytree")
+```
+
+# RankingPoints with previous 20 RankingPositions
+
+Validation phase with backtesting grid search:
+```{r}
+# Prepare necessary objects for grid search auxiliary function
+number_periods_for_test <- 35 # Last periods or tournaments to validate doing backtesting
+feature_periods <- features_id[2]
+data <- data_points_lag20
+periods_ordered <- unique(data[,feature_periods])[order(-unique(data[,feature_periods]))]
+periods_ordered <- periods_ordered[(length(periods_ordered)-number_periods_for_test):length(periods_ordered)]
+features <- features_points_lag20
+target <- target_points
+metric1 <- mse
+metric2 <- kendall
+metric3 <- mse
+
+# Save necessary objects for grid search auxiliary function
+save(feature_periods,periods_ordered,data,features,target,metric1,metric2,metric3,parametrizations,
+     file="Objects_backtesting_grid_search.RData")
+
+# Run backtesting grid search for parametrizations
+start <- Sys.time() # 21:45 06/02/2019
+grid_search_output <- plyr::llply(1:nrow(parametrizations),auxiliary,.parallel=TRUE)
+end <- Sys.time()
+end-start # 1:60 params 50 test = 6.73h # 1:288 params 35 test = 21.12h
+
+# Save validated metric values: 3 dataframe for each metric, with nrow=parametrizations and ncol=weeks
+results_metric1 <- parametrizations
+results_metric2 <- parametrizations
+# results_metric3 <- parametrizations
+for(p in 1:length(grid_search_output)){
+  for(period_index in 1:(length(periods_ordered)-1)){
+    results_metric1[p,paste0("Week_",periods_ordered[period_index+1])] <- grid_search_output[[p]][[1]][period_index]
+    results_metric2[p,paste0("Week_",periods_ordered[period_index+1])] <- grid_search_output[[p]][[2]][period_index]
+  }
+}
+results_metric1 <- as.data.frame(results_metric1)
+results_metric2 <- as.data.frame(results_metric2)
+results_metric1[,"Mean"] <- apply(results_metric1[,grepl("Week_",names(results_metric1))],1,mean)
+results_metric1[,"Variance"] <- apply(results_metric1[,grepl("Week_",names(results_metric1))],1,var)
+results_metric2[,"Mean"] <- apply(results_metric2[,grepl("Week_",names(results_metric1))],1,mean)
+results_metric2[,"Variance"] <- apply(results_metric2[,grepl("Week_",names(results_metric1))],1,var)
+save(results_metric1,results_metric2,file="Results_validation_points_lag20_param1to288_weekstest35.RData")
+```
+
+Predictions of best model of validation phase with backtesting grid search:
+- For MSE: parametrization: 267, 99, 124
+- For Kendall: 173, 195, 269
+```{r}
+# Prepare necessary objects for grid search auxiliary function
+number_periods_for_test <- 35 # Last periods or tournaments to validate doing backtesting
+feature_periods <- features_id[2]
+data <- data_points_lag20
+periods_ordered <- unique(data[,feature_periods])[order(-unique(data[,feature_periods]))]
+periods_ordered <- periods_ordered[(length(periods_ordered)-number_periods_for_test):length(periods_ordered)]
+features <- features_points_lag20
+target <- target_points
+
+p <- 269
+library(xgboost)
+predictions_test <- matrix(ncol=4)
+for(period_index in 1:(length(periods_ordered)-1)){ 
+  # Train set: all periods until period_index included
+  train <- data[data[,feature_periods]>=periods_ordered[period_index],] # Higher period value means older
+  train_xgbDMatrix <- xgb.DMatrix(data=data.matrix(train[,features]),label=train[,target])
+  # Validation set: next period after period_index
+  test <- data[data[,feature_periods]==periods_ordered[period_index+1],]
+  test_xgbDMatrix <- xgb.DMatrix(data=data.matrix(test[,features]))
+  # Train model
+  set.seed(1)
+  model_XGB <- xgboost(data=train_xgbDMatrix,
+                       booster="gbtree",
+                       max_depth=parametrizations[p,"max_depth"],
+                       nrounds=parametrizations[p,"nrounds"],
+                       eta=parametrizations[p,"eta"],
+                       min_child_weight=parametrizations[p,"min_child_weight"],
+                       subsample=parametrizations[p,"subsample"],
+                       colsample_bytree=parametrizations[p,"colsample_bytree"],
+                       objective="reg:linear",
+                       num_parallel_tree=1,
+                       verbose=FALSE,
+                       missing=-9999) 
+  # Predict Test
+  predictions_test <- rbind(predictions_test,as.matrix(cbind(test[,1:3],predict(model_XGB,test_xgbDMatrix))))
+}
+predictions_test <- as.data.frame(predictions_test[-1,])
+names(predictions_test) <- c("Golfer","Week",target,paste0("Prediction_",target))
+save(predictions_test,file=paste0("Predictions_points_lag20_test35weeks_param",p,".RData"))
+```
+
+# Check if sending data to James contains all/and only original cases (by index Golfer,Week,Target)
+```{r}
+sent <- predictions_test[,1:3]
+sent <- sent[with(sent,order(Golfer,Week,RankingPoints)),]
+original <- data[data[,feature_periods] %in% periods_ordered[2:length(periods_ordered)],1:3]
+original <- original[with(original,order(Golfer,Week,RankingPoints)),]
+dim(sent)
+dim(original)
+mean(sent==original)
+```
+
+```{r}
+for(week in unique(test$Week)){
+  cat("WEEK ",week,"\n")
+  pred_week <- prediction_XGB[test$Week==week]
+  true_values_week <- test[test$Week==week,target]
+  cat(length(true_values_week)," ", length(unique(true_values_week)),length(unique(pred_week)),"\n")
+  plot(true_values_week,pred_week,ylab = "Prediction",xlab = "True Points",main =  paste0("Week ",week),
+        xlim = c(0,50),ylim = c(0,50))
+  cat("For week ",week," the rmse is: ",metric(true_values_week,pred_week),"\n")
+  cat("For week ",week," the correlation is: ",metric3(true_values_week,pred_week),"\n")
+  cat("\n")
+  
+  rank_pred <- order(-pred_week)
+  rank_true <- order(-true_values_week)
+  results <- data.frame(True_top5_poition=rank_true,Prediction_top5_position=rank_pred)
+  print(head(results,7))
+  cat("How much top7 predicted is in rel top 7?",sum(rank_pred[1:7] %in% rank_true[1:7]))
+  cat("\n")
+}
+```
+
+Train optimal model with all data and save model:
+```{r}
+data <- data_points_lag20
+features <- features_points_lag20
+target <- target_points
+p <- 267
+library(xgboost)
+  train <- data
+  train_xgbDMatrix <- xgb.DMatrix(data=data.matrix(train[,features]),label=train[,target])
+  # Train model
+  set.seed(1)
+start <- Sys.time() 
+    model_XGB <- xgboost(data=train_xgbDMatrix,
+                       booster="gbtree",
+                       max_depth=parametrizations[p,"max_depth"],
+                       nrounds=parametrizations[p,"nrounds"],
+                       eta=parametrizations[p,"eta"],
+                       min_child_weight=parametrizations[p,"min_child_weight"],
+                       subsample=parametrizations[p,"subsample"],
+                       colsample_bytree=parametrizations[p,"colsample_bytree"],
+                       objective="reg:linear",
+                       num_parallel_tree=1,
+                       verbose=FALSE,
+                       missing=-9999)
+xgb.save(model_XGB,paste0("Models/Model_points_lag20_param",p,".model"))
+end <- Sys.time()
+end-start
+```

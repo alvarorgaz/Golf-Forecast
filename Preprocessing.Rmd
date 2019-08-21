@@ -1,0 +1,412 @@
+---
+title: "GolfForecast - Preprocessing"
+author: "Álvaro Orgaz Expósito"
+date: "5 February 2019"
+output: html_document
+---
+
+# Read data
+
+```{r}
+library(readxl)
+data <- read_xlsx(path="Data.xlsx",col_names=TRUE,na="")
+data <- as.data.frame(data)
+data <- data[order(data$Week),]
+```
+
+# Preliminary analysis
+
+Unique values.
+```{r}
+sapply(data,function(x) length(unique(x))) 
+```
+
+Number of competitions (unique "Weeks") per golfer.
+```{r}
+number_competitions_per_golfer <- sapply(unique(data$GolferID), 
+                                         function(x) length(unique(data[data$GolferID==x,"Week"])))
+cumsum(table(number_competitions_per_golfer)/length(number_competitions_per_golfer))
+hist(number_competitions_per_golfer)
+```
+
+Raw statistics.
+```{r}
+summary(data)
+hist(data$RankingPoints,breaks=c(0,1,2,3,4,5,25,50,75,100))
+hist(data$Position)
+```
+
+Golfers with more than 1 competition by week.
+```{r}
+number_competitions_per_golfer_per_week <- c()
+golfers <- c()
+weeks <- c()
+for(golfer in unique(data$GolferID)){
+  for(week in unique(data[data$GolferID==golfer,"Week"])){
+    number_competitions_per_golfer_per_week <- c(number_competitions_per_golfer_per_week,
+                                                 nrow(data[data$GolferID==golfer & data$Week==week,]))
+    golfers <- c(golfers,golfer)
+    weeks <- c(weeks,week)
+  }
+}
+```
+
+```{r}
+mean(number_competitions_per_golfer_per_week>1) # 0.7% of golfers-week pairs have more than 1 result per week
+data.frame(Number=number_competitions_per_golfer_per_week[number_competitions_per_golfer_per_week>1],
+           GolferID=golfers[number_competitions_per_golfer_per_week>1],
+           Week=weeks[number_competitions_per_golfer_per_week>1])
+```
+
+# Preparing data (lagged variables) for predicting: Positions with previous 15 Positions
+
+Bins of Positions for binning the feature later and help the model to find correlations.
+```{r}
+quantile(data$Position,probs=seq(0,1,0.25),na.rm=TRUE) # 1 25 56 95 240 
+breaks_position <- c(1,5,25,56,95,240)
+```
+
+Maximum lag of 15 weeks ago:
+- Mean of best 5 values
+- Mean of worst 5 values
+- Iterate every row of data and create 15 columns or lagged features with previous values for the golfer
+- Add the binning of features
+- Add mean value for groups of 5 previous weeks (without considering missings -9999)
+- Add variance of lagged features or previous values
+```{r}
+start <- Sys.time()
+target <- "Position"
+max_lag <- 15
+oldest_week <- max(data$Week)
+data_position_lag15 <- matrix(ncol=5+max_lag)
+for(i in 1:nrow(data)){
+  golfer <- data[i,"GolferID"]
+  week <- data[i,"Week"]
+  value <- data[i,target]
+  if(!is.na(value)){ # We do not want to predict missings
+    if(week<=(oldest_week-max_lag)){ # We only consider rows of data when at least the week is more recent than
+                                     # the oldest week plus max_lag weeks
+      data_golfer <- data[data$GolferID==golfer,]
+      # Mean of best 5 values
+      best_values <- ifelse(target=="RankingPoints",
+                             mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE),
+                             mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE))
+      best_values <- ifelse(is.na(best_values),-9999,best_values)
+      # Mean of worst 5 values
+      worst_values <- ifelse(target=="RankingPoints",
+                              mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE),
+                              mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE))
+      worst_values <- ifelse(is.na(worst_values),-9999,worst_values)
+      # Lags
+      lagged_values <- c()
+      for(lag in 1:max_lag){
+        lagged_value <- mean(data_golfer[data_golfer$Week==(week+lag),target]) # Mean because some golfers
+                                                                               # compete twice per week
+        lagged_value <- ifelse(is.na(lagged_value),-9999,lagged_value) # We impute -9999 if golfer did not
+                                                                       # compete or compete but missing value
+        lagged_values <- c(lagged_values,lagged_value)
+      }
+      new_row <- c(golfer,week,value,best_values,worst_values,lagged_values)
+      data_position_lag15 <- rbind(data_position_lag15,new_row)
+    }
+  }
+}
+data_position_lag15 <- as.data.frame(data_position_lag15[2:nrow(data_position_lag15),])
+lagged_features <- paste0(target,"_Lag",1:max_lag)
+colnames(data_position_lag15) <- c("Golfer","Week",target,"Bests","Worsts",lagged_features)
+
+# Binning lagged features
+for(feature in lagged_features){
+  binned_feature <- cut(x=data_position_lag15[,feature],breaks=breaks_position,include.lowest=TRUE)
+  levels(binned_feature) <- c("-9999",levels(binned_feature))
+  binned_feature[is.na(binned_feature)] <- "-9999"
+  data_position_lag15[,paste0(feature,"_Bin")] <- as.numeric(binned_feature) # Label encoding for model
+}
+
+# Add mean value for groups of 5 previous weeks (without considering missings -9999)
+auxiliar_mean <- function(x) ifelse(!is.na(mean(x[!x==-9999])),mean(x[!x==-9999]),-9999)
+for(lag in seq(1,max_lag,5)){
+  data_position_lag15[,paste0(target,"_Lag",lag,"to",lag+4)] <- apply(data_position_lag15[,lagged_features[lag:(lag+4)]],
+                                                                      1,auxiliar_mean)
+}
+
+# Add variance of lagged features or previous values
+auxiliar_var <- function(x) ifelse(!is.na(var(x[!x==-9999])),var(x[!x==-9999]),-9999)
+data_position_lag15[,"Variance"] <- apply(data_position_lag15[,lagged_features],1,auxiliar_var)
+
+end <- Sys.time()
+end-start
+```
+
+How much rows have all previous values missing? How much rows have all features missing?
+```{r}
+table(sapply(1:nrow(data_position_lag15), function(x) mean(-9999==data_position_lag15[x,lagged_features])))
+sum(sapply(1:nrow(data_position_lag15),
+           function(x) mean(data_position_lag15[x,4:ncol(data_position_lag15)]==-9999))==1)
+```
+
+# Preparing data (lagged variables) for predicting: Positions with previous 20 Positions
+
+Bins of Positions for binning the feature later and help the model to find correlations.
+```{r}
+quantile(data$Position,probs=seq(0,1,0.25),na.rm=TRUE) # 1 25 56 95 240 
+breaks_position <- c(1,5,25,56,95,240)
+```
+
+Maximum lag of 20 weeks ago:
+- Mean of best 5 values
+- Mean of worst 5 values
+- Iterate every row of data and create 20 columns or lagged features with previous values for the golfer
+- Add the binning of features
+- Add mean value for groups of 5 previous weeks (without considering missings -9999)
+- Add variance of lagged features or previous values
+```{r}
+start <- Sys.time()
+target <- "Position"
+max_lag <- 20
+oldest_week <- max(data$Week)
+data_position_lag20 <- matrix(ncol=5+max_lag)
+for(i in 1:nrow(data)){
+  golfer <- data[i,"GolferID"]
+  week <- data[i,"Week"]
+  value <- data[i,target]
+  if(!is.na(value)){ # We do not want to predict missings
+    if(week<=(oldest_week-max_lag)){ # We only consider rows of data when at least the week is more recent than
+                                     # the oldest week plus max_lag weeks
+      data_golfer <- data[data$GolferID==golfer,]
+      # Mean of best 5 values
+      best_values <- ifelse(target=="RankingPoints",
+                             mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE),
+                             mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE))
+      best_values <- ifelse(is.na(best_values),-9999,best_values)
+      # Mean of worst 5 values
+      worst_values <- ifelse(target=="RankingPoints",
+                              mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE),
+                              mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE))
+      worst_values <- ifelse(is.na(worst_values),-9999,worst_values)
+      # Lags
+      lagged_values <- c()
+      for(lag in 1:max_lag){
+        lagged_value <- mean(data_golfer[data_golfer$Week==(week+lag),target]) # Mean because some golfers
+                                                                               # compete twice per week
+        lagged_value <- ifelse(is.na(lagged_value),-9999,lagged_value) # We impute -9999 if golfer did not
+                                                                       # compete or compete but missing value
+        lagged_values <- c(lagged_values,lagged_value)
+      }
+      new_row <- c(golfer,week,value,best_values,worst_values,lagged_values)
+      data_position_lag20 <- rbind(data_position_lag20,new_row)
+    }
+  }
+}
+data_position_lag20 <- as.data.frame(data_position_lag20[2:nrow(data_position_lag20),])
+lagged_features <- paste0(target,"_Lag",1:max_lag)
+colnames(data_position_lag20) <- c("Golfer","Week",target,"Bests","Worsts",lagged_features)
+
+# Binning lagged features
+for(feature in lagged_features){
+  binned_feature <- cut(x=data_position_lag20[,feature],breaks=breaks_position,include.lowest=TRUE)
+  levels(binned_feature) <- c("-9999",levels(binned_feature))
+  binned_feature[is.na(binned_feature)] <- "-9999"
+  data_position_lag20[,paste0(feature,"_Bin")] <- as.numeric(binned_feature) # Label encoding for model
+}
+
+# Add mean value for groups of 5 previous weeks (without considering missings -9999)
+auxiliar_mean <- function(x) ifelse(!is.na(mean(x[!x==-9999])),mean(x[!x==-9999]),-9999)
+for(lag in seq(1,max_lag,5)){
+  data_position_lag20[,paste0(target,"_Lag",lag,"to",lag+4)] <- apply(data_position_lag20[,lagged_features[lag:(lag+4)]],
+                                                                      1,auxiliar_mean)
+}
+
+# Add variance of lagged features or previous values
+auxiliar_var <- function(x) ifelse(!is.na(var(x[!x==-9999])),var(x[!x==-9999]),-9999)
+data_position_lag20[,"Variance"] <- apply(data_position_lag20[,lagged_features],1,auxiliar_var)
+
+end <- Sys.time()
+end-start
+```
+
+How much rows have all previous values missing? How much rows have all features missing?
+```{r}
+table(sapply(1:nrow(data_position_lag20), function(x) mean(-9999==data_position_lag20[x,lagged_features])))
+sum(sapply(1:nrow(data_position_lag20),
+           function(x) mean(data_position_lag20[x,4:ncol(data_position_lag20)]==-9999))==1)
+```
+
+# Preparing data (lagged variables) for predicting: RankingPoints with previous 15 RankingPoints
+
+Bins of RankingPoints for binning the feature later and help the model to find correlations.
+```{r}
+quantile(data$RankingPoints,probs=seq(0,1,0.25),na.rm=TRUE) # 0 0 0 1.8 100
+breaks_points <- c(0,1,2,5,100)
+```
+
+Maximum lag of 15 weeks ago:
+- Mean of best 5 values
+- Mean of worst 5 values
+- Iterate every row of data and create 15 columns or lagged features with previous values for the golfer
+- Add the binning of features
+- Add mean value for groups of 5 previous weeks (without considering missings -9999)
+- Add variance of lagged features or previous values
+```{r}
+start <- Sys.time()
+target <- "RankingPoints"
+max_lag <- 15
+oldest_week <- max(data$Week)
+data_points_lag15 <- matrix(ncol=5+max_lag)
+for(i in 1:nrow(data)){
+  golfer <- data[i,"GolferID"]
+  week <- data[i,"Week"]
+  value <- data[i,target]
+  if(!is.na(value)){ # We do not want to predict missings
+    if(week<=(oldest_week-max_lag)){ # We only consider rows of data when at least the week is more recent than
+                                     # the oldest week plus max_lag weeks
+      data_golfer <- data[data$GolferID==golfer,]
+      # Mean of best 5 values
+      best_values <- ifelse(target=="RankingPoints",
+                             mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE),
+                             mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE))
+      best_values <- ifelse(is.na(best_values),-9999,best_values)
+      # Mean of worst 5 values
+      worst_values <- ifelse(target=="RankingPoints",
+                              mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE),
+                              mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE))
+      worst_values <- ifelse(is.na(worst_values),-9999,worst_values)
+      # Lags
+      lagged_values <- c()
+      for(lag in 1:max_lag){
+        lagged_value <- mean(data_golfer[data_golfer$Week==(week+lag),target]) # Mean because some golfers
+                                                                               # compete twice per week
+        lagged_value <- ifelse(is.na(lagged_value),-9999,lagged_value) # We impute -9999 if golfer did not
+                                                                       # compete or compete but missing value
+        lagged_values <- c(lagged_values,lagged_value)
+      }
+      new_row <- c(golfer,week,value,best_values,worst_values,lagged_values)
+      data_points_lag15 <- rbind(data_points_lag15,new_row)
+    }
+  }
+}
+data_points_lag15 <- as.data.frame(data_points_lag15[2:nrow(data_points_lag15),])
+lagged_features <- paste0(target,"_Lag",1:max_lag)
+colnames(data_points_lag15) <- c("Golfer","Week",target,"Bests","Worsts",lagged_features)
+
+# Binning lagged features
+for(feature in lagged_features){
+  binned_feature <- cut(x=data_points_lag15[,feature],breaks=breaks_position,include.lowest=TRUE)
+  levels(binned_feature) <- c("-9999",levels(binned_feature))
+  binned_feature[is.na(binned_feature)] <- "-9999"
+  data_points_lag15[,paste0(feature,"_Bin")] <- as.numeric(binned_feature) # Label encoding for model
+}
+
+# Add mean value for groups of 5 previous weeks (without considering missings -9999)
+auxiliar_mean <- function(x) ifelse(!is.na(mean(x[!x==-9999])),mean(x[!x==-9999]),-9999)
+for(lag in seq(1,max_lag,5)){
+  data_points_lag15[,paste0(target,"_Lag",lag,"to",lag+4)] <- apply(data_points_lag15[,lagged_features[lag:(lag+4)]],
+                                                                      1,auxiliar_mean)
+}
+
+# Add variance of lagged features or previous values
+auxiliar_var <- function(x) ifelse(!is.na(var(x[!x==-9999])),var(x[!x==-9999]),-9999)
+data_points_lag15[,"Variance"] <- apply(data_points_lag15[,lagged_features],1,auxiliar_var)
+
+end <- Sys.time()
+end-start
+```
+
+How much rows have all previous values missing? How much rows have all features missing?
+```{r}
+table(sapply(1:nrow(data_points_lag15), function(x) mean(-9999==data_points_lag15[x,lagged_features])))
+sum(sapply(1:nrow(data_points_lag15),
+           function(x) mean(data_points_lag15[x,4:ncol(data_points_lag15)]==-9999))==1)
+```
+
+# Preparing data (lagged variables) for predicting: RankingPoints with previous 20 RankingPoints
+
+Bins of RankingPoints for binning the feature later and help the model to find correlations.
+```{r}
+quantile(data$RankingPoints,probs=seq(0,1,0.25),na.rm=TRUE) # 0 0 0 1.8 100
+breaks_points <- c(0,1,2,5,100)
+```
+
+Maximum lag of 20 weeks ago:
+- Mean of best 5 values
+- Mean of worst 5 values
+- Iterate every row of data and create 20 columns or lagged features with previous values for the golfer
+- Add the binning of features
+- Add mean value for groups of 5 previous weeks (without considering missings -9999)
+- Add variance of lagged features or previous values
+```{r}
+start <- Sys.time()
+target <- "RankingPoints"
+max_lag <- 20
+oldest_week <- max(data$Week)
+data_points_lag20 <- matrix(ncol=5+max_lag)
+for(i in 1:nrow(data)){
+  golfer <- data[i,"GolferID"]
+  week <- data[i,"Week"]
+  value <- data[i,target]
+  if(!is.na(value)){ # We do not want to predict missings
+    if(week<=(oldest_week-max_lag)){ # We only consider rows of data when at least the week is more recent than
+                                     # the oldest week plus max_lag weeks
+      data_golfer <- data[data$GolferID==golfer,]
+      # Mean of best 5 values
+      best_values <- ifelse(target=="RankingPoints",
+                             mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE),
+                             mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE))
+      best_values <- ifelse(is.na(best_values),-9999,best_values)
+      # Mean of worst 5 values
+      worst_values <- ifelse(target=="RankingPoints",
+                              mean(data_golfer[order(data_golfer[,target])[1:5],target],na.rm=TRUE),
+                              mean(data_golfer[order(-data_golfer[,target])[1:5],target],na.rm=TRUE))
+      worst_values <- ifelse(is.na(worst_values),-9999,worst_values)
+      # Lags
+      lagged_values <- c()
+      for(lag in 1:max_lag){
+        lagged_value <- mean(data_golfer[data_golfer$Week==(week+lag),target]) # Mean because some golfers
+                                                                               # compete twice per week
+        lagged_value <- ifelse(is.na(lagged_value),-9999,lagged_value) # We impute -9999 if golfer did not
+                                                                       # compete or compete but missing value
+        lagged_values <- c(lagged_values,lagged_value)
+      }
+      new_row <- c(golfer,week,value,best_values,worst_values,lagged_values)
+      data_points_lag20 <- rbind(data_points_lag20,new_row)
+    }
+  }
+}
+data_points_lag20 <- as.data.frame(data_points_lag20[2:nrow(data_points_lag20),])
+lagged_features <- paste0(target,"_Lag",1:max_lag)
+colnames(data_points_lag20) <- c("Golfer","Week",target,"Bests","Worsts",lagged_features)
+
+# Binning lagged features
+for(feature in lagged_features){
+  binned_feature <- cut(x=data_points_lag20[,feature],breaks=breaks_position,include.lowest=TRUE)
+  levels(binned_feature) <- c("-9999",levels(binned_feature))
+  binned_feature[is.na(binned_feature)] <- "-9999"
+  data_points_lag20[,paste0(feature,"_Bin")] <- as.numeric(binned_feature) # Label encoding for model
+}
+
+# Add mean value for groups of 5 previous weeks (without considering missings -9999)
+auxiliar_mean <- function(x) ifelse(!is.na(mean(x[!x==-9999])),mean(x[!x==-9999]),-9999)
+for(lag in seq(1,max_lag,5)){
+  data_points_lag20[,paste0(target,"_Lag",lag,"to",lag+4)] <- apply(data_points_lag20[,lagged_features[lag:(lag+4)]],
+                                                                      1,auxiliar_mean)
+}
+
+# Add variance of lagged features or previous values
+auxiliar_var <- function(x) ifelse(!is.na(var(x[!x==-9999])),var(x[!x==-9999]),-9999)
+data_points_lag20[,"Variance"] <- apply(data_points_lag20[,lagged_features],1,auxiliar_var)
+
+end <- Sys.time()
+end-start
+```
+
+How much rows have all previous values missing? How much rows have all features missing?
+```{r}
+table(sapply(1:nrow(data_points_lag20), function(x) mean(-9999==data_points_lag20[x,lagged_features])))
+sum(sapply(1:nrow(data_points_lag20),
+           function(x) mean(data_points_lag20[x,4:ncol(data_points_lag20)]==-9999))==1)
+```
+
+# Save models data
+```{r}
+save(data,data_position_lag15,data_position_lag20,data_points_lag15,data_points_lag20,file="Data.RData")
+```
