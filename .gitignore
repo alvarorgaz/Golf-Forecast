@@ -1,5 +1,7 @@
-Data.xlsx
-Data\ preprocessed.Rdata
-1.\ Preliminary\ analysis.html
+*.xlsx
+*.RData
+*.Rhistory
+*.html
+*.model
+*.txt
 OLD/
-.Rhistory
