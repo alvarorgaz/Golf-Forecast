@@ -1,6 +1,6 @@
 ---
 title: "GolfForecast - Preliminary analysis"
-author: "√Ålvaro Orgaz Exp√≥sito"
+author: "¡lvaro Orgaz ExpÛsito"
 output: html_document
 ---
 

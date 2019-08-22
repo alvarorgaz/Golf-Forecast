@@ -1,0 +1,214 @@
+---
+title: "GolfForecast - Modelling"
+author: "Álvaro Orgaz Expósito"
+output: html_document
+---
+
+## Load preprocessed data
+
+```{r}
+load("Data_preprocessed.RData")
+data <- data_preprocessed
+rm(data_preprocessed)
+```
+
+# Activate parallelization
+
+```{r}
+max_threads <- parallel::detectCores()
+cluster <- parallel::makeCluster(max_threads)
+doParallel::registerDoParallel(cluster)
+```
+
+## Define performance metrics
+
+```{r}
+mse <- function(true_values, predictions){return(mean((true_values-predictions)^2))}
+spearman <- function(true_values, predictions){return(cor(true_values, predictions, method="spearman"))}
+```
+
+## Resume of features
+
+```{r}
+ids <- c("GolferID","Week")
+target <- "RankingPoints"
+features <- names(data)[!(names(data) %in% c(ids,target))]
+```
+
+## Defining candidate parametrizations of XGBoost
+
+```{r}
+max_depth <- c(10,15)
+nrounds <- c(500,250,100,50)
+eta <- c(0.01,0.05,0.1)
+min_child_weight <- c(5,10,15)
+subsample <- c(0.5,0.75)
+colsample_bytree <-  c(0.5,0.75) 
+parametrizations <- expand.grid(max_depth, nrounds, eta, min_child_weight, subsample, colsample_bytree)
+names(parametrizations) <- c("max_depth","nrounds","eta","min_child_weight","subsample","colsample_bytree")
+```
+
+## Parallel auxiliar function for optimal parametrization search with back-testing validation
+
+This auxiliary function that does back-testing validation for one given parametrization of XGBoost model. Basically, it returns the metrics values MSE and Spearman for the 50 most recent weeks in the preprocessed data using until the respective previous week for training the model and the week in question (plus the following 9) as validation set (simulating a real new tournaments prediction). It is like a rolling window but with window size 10 weeks (for avoiding training the same model several times with only few weeks more data).
+```{r}
+number_weeks_val <- 50
+weeks_val <- unique(data$Week)[1:number_weeks_val]
+weeks_val_from_old_to_recent <- weeks_val[order(-weeks_val)]
+backtesting_window_size <- 10
+save(backtesting_window_size, weeks_val_from_old_to_recent, data, features, target, mse, spearman, parametrizations, file="tmp.RData")
+auxiliary <- function(p){
+  load("tmp.RData")
+  library(xgboost)
+  mse_by_weeks <- c()
+  spearman_by_weeks <- c()
+  weeks_check <- c()
+  for(index in seq(1, length(weeks_val_from_old_to_recent), backtesting_window_size)){ # AQUI esto tiene que ser based on quantile(data$Week,probs = seq(0,1,0.05)), no puedo estar retrenando 5 mind e modelo con 2% solo de datos
+    train <- data[data$Week>weeks_val_from_old_to_recent[index],]
+    train_xgbDMatrix <- xgb.DMatrix(data=data.matrix(train[,features]), label=train[,target])
+    set.seed(1)
+    model <- xgboost(data=train_xgbDMatrix,
+                     booster="gbtree",
+                     max_depth=parametrizations[p,"max_depth"],
+                     nrounds=parametrizations[p,"nrounds"],
+                     eta=parametrizations[p,"eta"],
+                     min_child_weight=parametrizations[p,"min_child_weight"],
+                     subsample=parametrizations[p,"subsample"],
+                     colsample_bytree=parametrizations[p,"colsample_bytree"],
+                     num_parallel_tree=1,
+                     verbose=FALSE,
+                     missing=-9999)
+    for(week in weeks_val_from_old_to_recent[index:(index+backtesting_window_size-1)]){
+      val <- data[data$Week==week,]
+      val_xgbDMatrix <- xgb.DMatrix(data=data.matrix(val[,features]))
+      val_prediction <- predict(model, val_xgbDMatrix)
+      mse_by_weeks <- c(mse_by_weeks, mse(val[,target], val_prediction))
+      spearman_by_weeks <- c(spearman_by_weeks, spearman(val[,target], val_prediction))
+      weeks_check <- c(weeks_check, week)
+    }
+  }
+  return(list(mse_by_weeks, spearman_by_weeks, weeks_check))
+}
+```
+
+## Optimal parametrization search with back-testing validation
+
+Running the optimal parametrization search with back-testing validation in parallel:
+```{r}
+start <- Sys.time()
+search_results <- plyr::llply(1:2, auxiliary, .parallel=TRUE) # nrow(parametrizations)
+end <- Sys.time()
+end-start
+```
+
+Saving the metrics results by validation weeks:
+```{r}
+validation_results_mse <- parametrizations[1:2,]
+validation_results_spearman <- parametrizations[1:2,]
+validation_results_weeks_check <- parametrizations[1:2,] # OUT
+weeks_names <- paste0("Week_",weeks_val_from_old_to_recent)
+for(p in 1:2){ # nrow(parametrizations)
+  validation_results_mse[p,weeks_names] <- search_results[[p]][[1]]
+  validation_results_spearman[p,weeks_names] <- search_results[[p]][[2]]
+  validation_results_weeks_check[p,weeks_names] <- search_results[[p]][[3]] # OUT
+}
+validation_results_mse[,"Mean"] <- apply(validation_results_mse[,weeks_names], 1, mean)
+validation_results_mse[,"Variance"] <- apply(validation_results_mse[,weeks_names], 1, var)
+validation_results_spearman[,"Mean"] <- apply(validation_results_spearman[,weeks_names], 1, mean)
+validation_results_spearman[,"Variance"] <- apply(validation_results_spearman[,weeks_names], 1, var)
+save(validation_results_mse, validation_results_spearman, file="Results_validation.RData")
+```
+
+## Train and save final optimal models
+
+```{r}
+library(xgboost)
+load("Results_validation.RData")
+load("Data_preprocessed.RData")
+```
+
+The parametrization with the best trade-off of low mean and low variance of MSE in validation weeks is: *booster*="gbtree", *max_depth*=, *nrounds*=, *eta*=, *min_child_weight*=, *subsample*=, *colsample_bytree*=, *num_parallel_tree*=1, *verbose*=FALSE, *missing*=-9999.
+
+The parametrization with the best trade-off of high mean and low variance of Spearman correlation in validation weeks is: *booster*="gbtree", *max_depth*=, *nrounds*=, *eta*=, *min_child_weight*=, *subsample*=, *colsample_bytree*=, *num_parallel_tree*=1, *verbose*=FALSE, *missing*=-9999.
+
+Also, I will train for each metric two models, one with all data available and other without the validation weeks (50 most recent ones). It is used for testing and production purposes.
+
+```{r}
+library(xgboost)
+train_all_xgbDMatrix <- xgb.DMatrix(data=data.matrix(data[,features]), label=data[,target])
+train_wo_val <- data[data$Week>weeks_val_from_old_to_recent[1],]
+train_wo_val_xgbDMatrix <- xgb.DMatrix(data=data.matrix(train_wo_val[,features]), label=train_wo_val[,target])
+set.seed(1)
+start <- Sys.time()
+model_mse_all <- xgboost(data=train_all_xgbDMatrix,
+                         booster="gbtree",
+                         max_depth=parametrizations[1,"max_depth"],
+                         nrounds=parametrizations[1,"nrounds"],
+                         eta=parametrizations[1,"eta"],
+                         min_child_weight=parametrizations[1,"min_child_weight"],
+                         subsample=parametrizations[1,"subsample"],
+                         colsample_bytree=parametrizations[1,"colsample_bytree"],
+                         num_parallel_tree=1,
+                         verbose=FALSE,
+                         missing=-9999)
+end <- Sys.time()
+end-start # Time difference of 5.548187 mins
+xgb.save(model_mse_all, "Model_mse_all.model")
+model_spearman_all <- xgboost(data=train_all_xgbDMatrix,
+                              booster="gbtree",
+                              max_depth=parametrizations[???,"max_depth"],
+                              nrounds=parametrizations[???,"nrounds"],
+                              eta=parametrizations[???,"eta"],
+                              min_child_weight=parametrizations[???,"min_child_weight"],
+                              subsample=parametrizations[???,"subsample"],
+                              colsample_bytree=parametrizations[???,"colsample_bytree"],
+                              num_parallel_tree=1,
+                              verbose=FALSE,
+                              missing=-9999)
+xgb.save(model_spearman_all, "Model_spearman_all.model")
+model_mse_wo_val <- xgboost(data=train_wo_val_xgbDMatrix,
+                            booster="gbtree",
+                            max_depth=parametrizations[???,"max_depth"],
+                            nrounds=parametrizations[???,"nrounds"],
+                            eta=parametrizations[???,"eta"],
+                            min_child_weight=parametrizations[???,"min_child_weight"],
+                            subsample=parametrizations[???,"subsample"],
+                            colsample_bytree=parametrizations[???,"colsample_bytree"],
+                            num_parallel_tree=1,
+                            verbose=FALSE,
+                            missing=-9999)
+xgb.save(model_mse_wo_val, "Model_mse_wo_val.model")
+model_spearman_wo_val <- xgboost(data=train_wo_val_xgbDMatrix,
+                                 booster="gbtree",
+                                 max_depth=parametrizations[???,"max_depth"],
+                                 nrounds=parametrizations[???,"nrounds"],
+                                 eta=parametrizations[???,"eta"],
+                                 min_child_weight=parametrizations[???,"min_child_weight"],
+                                 subsample=parametrizations[???,"subsample"],
+                                 colsample_bytree=parametrizations[???,"colsample_bytree"],
+                                 num_parallel_tree=1,
+                                 verbose=FALSE,
+                                 missing=-9999)
+xgb.save(model_spearman_wo_val, "Model_spearman_wo_val.model")
+```
+
+```{r}
+for(week in unique(test$Week)){
+  cat("WEEK ",week,"\n")
+  pred_week <- prediction_XGB[test$Week==week]
+  true_values_week <- test[test$Week==week,target]
+  cat(length(true_values_week)," ", length(unique(true_values_week)),length(unique(pred_week)),"\n")
+  plot(true_values_week,pred_week,ylab = "Prediction",xlab = "True Points",main =  paste0("Week ",week),
+        xlim = c(0,50),ylim = c(0,50))
+  cat("For week ",week," the rmse is: ",metric(true_values_week,pred_week),"\n")
+  cat("For week ",week," the correlation is: ",metric3(true_values_week,pred_week),"\n")
+  cat("\n")
+  
+  rank_pred <- order(-pred_week)
+  rank_true <- order(-true_values_week)
+  results <- data.frame(True_top5_poition=rank_true,Prediction_top5_position=rank_pred)
+  print(head(results,7))
+  cat("How much top7 predicted is in rel top 7?",sum(rank_pred[1:7] %in% rank_true[1:7]))
+  cat("\n")
+}
+```
