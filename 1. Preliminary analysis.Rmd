@@ -22,7 +22,7 @@ doParallel::registerDoParallel(cluster)
 
 ## Preliminary analysis
 
-Number of unique values:
+Number of unique values by variable:
 ```{r}
 sapply(data, function(x) length(unique(x))) 
 ```
@@ -50,7 +50,7 @@ auxiliary <- function(golfer){
   load("tmp.RData")
   result <- data.frame()
   for(week in unique(data$Week[data$GolferID==golfer])){
-    result <- rbind(result, c(golfer,week,nrow(data[data$GolferID==golfer & data$Week==week,])))
+    result <- rbind(result, c(golfer,week,sum(data$GolferID==golfer & data$Week==week)))
   }
   colnames(result) <- c("GolferID","Week","Frequency")
   return(result)
@@ -58,8 +58,6 @@ auxiliary <- function(golfer){
 list_competitions_per_golfer_week <- plyr::llply(unique(data$GolferID), auxiliary, .parallel=TRUE)
 competitions_per_golfer_week <- data.frame(do.call("rbind", list_competitions_per_golfer_week))
 file.remove("tmp.Rdata")
-cat("There are", sum(competitions_per_golfer_week$Frequency>1),"cases of golfers with >1 competition per week and these are all the cases:")
+cat("There are", sum(competitions_per_golfer_week$Frequency>1), "cases of golfers with >1 competition per week. This is the list:")
 competitions_per_golfer_week[competitions_per_golfer_week$Frequency>1,]
 ```
-
-
