@@ -1,6 +1,5 @@
 # Golf Forecast
-### I am Álvaro Orgaz Expósito, a data science student at KTH (Stockholm, Sweden) and Aalto (Helsinki, Finland), as well as a statistician
-## I am Álvaro Orgaz Expósito, a data science student at KTH (Stockholm, Sweden) and Aalto (Helsinki, Finland), as well as a statistician
+
 **Author:** I am Álvaro Orgaz Expósito, a data science student at KTH (Stockholm, Sweden) and Aalto (Helsinki, Finland), as well as a statistician from UPC-UB (Barcelona, Spain).
 
 **Abstract:** 
